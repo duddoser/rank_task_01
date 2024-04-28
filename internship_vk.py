@@ -14,8 +14,10 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 from catboost import CatBoostRanker, Pool
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import ndcg_score
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import ndcg_score, mean_squared_error
+import xgboost as xgb
+from sklearn.preprocessing import StandardScaler
 
 data = pd.read_csv('intern_task.csv', sep=',')
 
@@ -37,14 +39,37 @@ data = data.astype({'feature_119': 'float64'})
 
 data['feature_119'].unique()
 
-fig = plt.figure(figsize= (15,10))
-sns.heatmap(data, cmap='Blues')
-plt.show()
+#data.corr().style.background_gradient(cmap='coolwarm')
 
-unique_items = data[2:].nunique()
-good_cols = [i + 2 for i in range(144) if unique_items[i] > 40]
-good_cols = [0, 1] + good_cols
-data = data.iloc[:, good_cols]
+nan_features = ['feature_64', 'feature_65', 'feature_72', 'feature_100']
+data = data.drop(nan_features, axis=1)
+data.corr().style.background_gradient(cmap='coolwarm')
+
+"""Возможно стоит не безвозмездно удалять фичи, а их вес уменьшать."""
+
+data.iloc[:, 2].corr(data.iloc[:, 7])
+
+linearly_dependent_columns = set()
+for i in range(2, len(data.columns)):
+  for j in range(i + 1, len(data.columns)):
+    if i not in linearly_dependent_columns and  \
+    data.iloc[:, i].corr(data.iloc[:, j]) > 0.9:
+      linearly_dependent_columns.add(j)
+all_columns = set([i for i in range(len(data.columns))])
+good_columns = all_columns - linearly_dependent_columns
+data = data.iloc[:, list(good_columns)]
+print(len(linearly_dependent_columns))
+data
+
+data.hist(bins=30, figsize=(40, 25))
+
+scaler = StandardScaler()
+scaler.fit(data.iloc[:, 2:])
+data_norm = pd.DataFrame(scaler.transform(data.iloc[:, 2:]),
+                         columns = data.columns[2:])
+
+data_other = data.drop(columns = data.columns[2:])
+data_new = pd.concat([data_norm, data_other], axis = 1)
 
 """Нужно сгруппировать по query_id."""
 
@@ -56,6 +81,8 @@ df_train = pd.DataFrame.join(X_train, y_train, how='left')
 df_test = pd.DataFrame.join(X_test, y_test, how='left')
 df_train = df_train.sort_values(by='query_id')
 df_test = df_test.sort_values(by='query_id')
+df_val = df_train.iloc[:int(len(df_train) * 0.2)]
+df_train = df_train.iloc[int(len(df_train) * 0.2):]
 
 target = ['rank']
 features = data.columns[2:]
@@ -72,19 +99,230 @@ test_pool = Pool(
     group_id = df_test['query_id'].tolist()
 )
 
+val_pool = Pool(
+    data = df_val[features],
+    label = df_val[target],
+    group_id = df_val['query_id'].tolist()
+)
+
+params = {
+    'loss_function' : ['YetiRank', 'YetiRankPairwise'],
+    'auto_class_weights' : ['None', 'Balanced'],
+    'score_function' : ['L2', 'Cosine'],
+     'depth' : [i for i in range(3, 15)]
+}
+
 model = CatBoostRanker(loss_function='YetiRank',
                        verbose=100,
+                       n_estimators = 60,
+                       depth = 5,
                        random_seed=42)
-model.fit(train_pool, early_stopping_rounds=100)
-result = model.predict(test_pool)
+model.fit(train_pool, eval_set=val_pool, early_stopping_rounds=100)
+result_cat = model.predict(test_pool)
+
+"""Эээээээ, ну это просто замечательно, но не переобучается ли выборка...."""
 
 model_ndcg = ndcg_score(
     [df_test[target].values.reshape((len(df_test[target].values),)).tolist()],
-     [result.tolist()])
+     [result_cat.tolist()], k = 5)
 model_ndcg
 
-g = []
-for i in unique_items:
-  if i > 200:
-    g.append(i)
-print(len(g))
+"""RMSE:"""
+
+np.sqrt(mean_squared_error(
+    [df_test[target].values.reshape((len(df_test[target].values),)).tolist()],
+     [result_cat.tolist()]))
+
+"""Применим другие метрики качества."""
+
+def _ark(actual: list, predicted: list, k=10) -> float:
+    """
+    Computes the average recall at k.
+    Parameters
+    ----------
+    actual : list
+        A list of actual items to be predicted
+    predicted : list
+        An ordered list of predicted items
+    k : int, default = 10
+        Number of predictions to consider
+    Returns:
+    -------
+    score : float
+        The average recall at k.
+    """
+    if len(predicted)>k:
+        predicted = predicted[:k]
+
+    score = 0.0
+    num_hits = 0.0
+
+    for i,p in enumerate(predicted):
+        if p in actual and p not in predicted[:i]:
+            num_hits += 1.0
+            score += num_hits / (i+1.0)
+
+    if not actual:
+        return 0.0
+
+    return score / len(actual)
+
+def _apk(actual: list, predicted: list, k=10) -> float:
+    """
+    Computes the average precision at k.
+    Parameters
+    ----------
+    actual : list
+        A list of actual items to be predicted
+    predicted : list
+        An ordered list of predicted items
+    k : int, default = 10
+        Number of predictions to consider
+    Returns:
+    -------
+    score : float
+        The average precision at k.
+    """
+    if not predicted or not actual:
+        return 0.0
+
+    if len(predicted) > k:
+        predicted = predicted[:k]
+
+    score = 0.0
+    true_positives = 0.0
+
+    for i, p in enumerate(predicted):
+        if p in actual and p not in predicted[:i]:
+            max_ix = min(i + 1, len(predicted))
+            score += _precision(predicted[:max_ix], actual)
+            true_positives += 1
+
+    if score == 0.0:
+        return 0.0
+
+    return score / true_positives
+
+def _precision(predicted, actual):
+    prec = [value for value in predicted if value in actual]
+    prec = float(len(prec)) / float(len(predicted))
+    return prec
+
+def recommender_precision(predicted: list[list], actual: list[list]) -> int:
+    """
+    Computes the precision of each user's list of recommendations, and averages precision over all users.
+    ----------
+    actual : a list of lists
+        Actual items to be predicted
+        example: [['A', 'B', 'X'], ['A', 'B', 'Y']]
+    predicted : a list of lists
+        Ordered predictions
+        example: [['X', 'Y', 'Z'], ['X', 'Y', 'Z']]
+    Returns:
+    -------
+        precision: int
+    """
+
+    precision = np.mean(list(map(lambda x, y: np.round(_precision(x,y), 4), predicted, actual)))
+    return precision
+
+def recommender_recall(predicted: list[list], actual: list[list]) -> int:
+    """
+    Computes the recall of each user's list of recommendations, and averages precision over all users.
+    ----------
+    actual : a list of lists
+        Actual items to be predicted
+        example: [['A', 'B', 'X'], ['A', 'B', 'Y']]
+    predicted : a list of lists
+        Ordered predictions
+        example: [['X', 'Y', 'Z'], ['X', 'Y', 'Z']]
+    Returns:
+    -------
+        recall: int
+    """
+    def calc_recall(predicted, actual):
+        reca = [value for value in predicted if value in actual]
+        reca = np.round(float(len(reca)) / float(len(actual)), 4)
+        return reca
+
+    recall = np.mean(list(map(calc_recall, predicted, actual)))
+    return recall
+
+"""Попробуем зафайнтюнить нашу модель. (Результат - cat_model)"""
+
+for trees in range(60, 120, 10):
+  for d in range(3, 9):
+    for loss in ['YetiRank', 'YetiRankPairwise', 'LambdaMart']:
+      model = CatBoostRanker(loss_function=loss,
+                       verbose=100,
+                       n_estimators = trees,
+                       depth = d,
+                       random_seed=42)
+      model.fit(train_pool, eval_set=val_pool, early_stopping_rounds=100)
+      result_cat = model.predict(test_pool)
+      model_ndcg = ndcg_score([df_test[target].values.reshape((len(df_test[target].values),)).tolist()],[result_cat.tolist()], k = 5)
+      print('NDCG of model with parametres n_estimators = ' +  str(trees) + ', depth = ' + str(d) + ', loss_function = ' + str(loss) + ': ' + str(model_ndcg))
+      print()
+
+xgb_model = xgb.XGBRanker(
+    tree_method="hist",
+    lambdarank_num_pair_per_sample=8,
+    objective="rank:ndcg",
+    lambdarank_pair_method="topk",
+    booster='gbtree',
+    random_state=42
+)
+
+xgb_group = df_train.groupby(by = 'query_id').size().to_frame('size')['size'].to_numpy()
+xgb_model.fit(df_train[features], df_train[target],
+              group=xgb_group, verbose=True)
+
+def ndcg_5(y_score, y_true):
+  top_rank = np.argsort(y_score)[::-1]
+  g = top_rank[:5]
+
+  y_true = np.take(y_true, top_rank[:5])
+  gain = 2 ** y_true - 1
+  frac = np.log2(np.arange(len(y_true)) + 2)
+  #print(gain / frac)
+  return np.sum(gain / frac)
+
+"""Отдельно для каждой группы предскажем значения."""
+
+xgb_ndcg = []
+groups = np.unique(df_test['query_id'])
+
+for i, query in enumerate(groups):
+  y = df_test[df_test['query_id'] == query][target]
+  y = y.to_numpy().reshape(len(y),)
+  if np.sum(y) == 0:
+    continue
+
+  result = xgb_model.predict(df_test[df_test['query_id'] == query][features])
+  score = ndcg_5(result, y) / ndcg_5(y, y)
+  xgb_ndcg.append(score)
+
+"""Есть над чем поработать :)"""
+
+np.mean(xgb_ndcg)
+
+#ndcg_5(result_cat, df_test[target].to_numpy().reshape(len(df_test[target]),))
+cat_ndcg = []
+groups = np.unique(df_test['query_id'])
+
+for i, query in enumerate(groups):
+  y = df_test[df_test['query_id'] == query][target]
+  y = y.to_numpy().reshape(len(y),)
+  if np.sum(y) == 0:
+    continue
+
+  result = xgb_model.predict(df_test[df_test['query_id'] == query][features])
+  score = ndcg_5(result, y) / ndcg_5(y, y)
+  xgb_ndcg.append(score)
+
+xgb_model.predict(df_test[features], df_test[target])
+
+xgb_model_ndcg = ndcg_score(
+    [df_test[target].values.reshape((len(df_test[target].values),)).tolist()],
+     [result.tolist()])
+xgb_model_ndcg
